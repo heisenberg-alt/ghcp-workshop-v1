@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "git-changelog": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["./changelog-mcp/index.js"]
+    }
+  }
+}
