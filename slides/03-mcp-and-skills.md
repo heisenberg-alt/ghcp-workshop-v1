@@ -164,63 +164,73 @@ Browse more at [github.com/modelcontextprotocol/servers](https://github.com/mode
 
 ## Building Your Own MCP Server
 
-### Conceptual Overview
+### Let's solve a real problem
+
+Every release, someone manually writes changelogs from `git log`. Let's automate it.
 
 ```
-1. Define your tools     →  What can the AI call?
-2. Implement handlers    →  What happens when it calls?
-3. Register & serve      →  Expose via stdio or HTTP
+1. Define your tools     →  generate-changelog, commit-stats
+2. Implement handlers    →  Parse git log, categorize commits
+3. Register & serve      →  Expose via stdio
 4. Configure in VS Code  →  Tell Copilot about your server
 ```
 
-Let's build one step by step.
+Then ask Copilot: *"Generate release notes since v1.2.0"*
 
 ---
 
 ## Step 1: Scaffold the Project
 
 ```bash
-mkdir my-mcp-server && cd my-mcp-server
+mkdir changelog-mcp && cd changelog-mcp
 npm init -y
-npm install @modelcontextprotocol/sdk
+npm install @modelcontextprotocol/sdk zod
 ```
 
 Create `index.js`:
 
 ```javascript
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from
-  "@modelcontextprotocol/sdk/server/stdio.js";
+import { StdioServerTransport }
+  from "@modelcontextprotocol/sdk/server/stdio.js";
+import { execSync } from "child_process";
+import { z } from "zod";
 
 const server = new McpServer({
-  name: "my-first-mcp",
+  name: "git-changelog",
   version: "1.0.0",
 });
 ```
 
 ---
 
-## Step 2: Define a Tool
+## Step 2: Define the Changelog Tool
 
 ```javascript
-import { z } from "zod";
-
 server.tool(
-  "analyze-text",
-  "Analyze text for word count and reading level",
-  { text: z.string().describe("The text to analyze") },
-  async ({ text }) => {
-    const words = text.split(/\s+/).length;
-    const sentences = text.split(/[.!?]+/).length;
-    const avgWordsPerSentence = (words / sentences).toFixed(1);
-
-    return {
-      content: [{
-        type: "text",
-        text: `Words: ${words}, Sentences: ${sentences}, ` +
-              `Avg words/sentence: ${avgWordsPerSentence}`
-      }]
-    };
+  "generate-changelog",
+  "Generate a structured changelog between two git refs",
+  {
+    from: z.string().describe("Start ref (tag, branch, or SHA)"),
+    to: z.string().default("HEAD").describe("End ref"),
+  },
+  async ({ from, to }) => {
+    const raw = execSync(
+      `git log ${from}..${to} --pretty=format:"%h|%s|%an|%ad" --date=short`,
+      { encoding: "utf-8" }
+    );
+    const commits = raw.trim().split("\n").map(line => {
+      const [hash, subject, author, date] = line.split("|");
+      return { hash, subject, author, date };
+    });
+    // Categorize by conventional commit prefix
+    const feat = [], fix = [], other = [];
+    for (const c of commits) {
+      if (c.subject.startsWith("feat")) feat.push(c);
+      else if (c.subject.startsWith("fix")) fix.push(c);
+      else other.push(c);
+    }
+    // ... build markdown output (see demo script)
   }
 );
 ```
@@ -233,7 +243,7 @@ server.tool(
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("MCP server running on stdio");
+  console.error("Git Changelog MCP server running on stdio");
 }
 
 main().catch(console.error);
@@ -241,29 +251,40 @@ main().catch(console.error);
 
 That's it — your server reads JSON-RPC from stdin and writes to stdout.
 
-**Full file is ~40 lines of code.**
+**Full server with 2 tools is ~90 lines of code.**
 
 ---
 
-## Step 4: Configure in VS Code
+## Step 4: Configure and Test
 
 Add to `.vscode/mcp.json`:
 
 ```json
 {
   "servers": {
-    "my-first-mcp": {
+    "git-changelog": {
       "type": "stdio",
       "command": "node",
-      "args": ["./my-mcp-server/index.js"]
+      "args": ["./changelog-mcp/index.js"]
     }
   }
 }
 ```
 
-Restart Copilot Chat → your tool appears in the tools list.
+Restart Copilot Chat → ask:
 
-Test it: *"Use the analyze-text tool on this paragraph..."*
+*"Generate release notes from v1.0.0 to HEAD"*
+
+```markdown
+# Changelog: v1.0.0 → HEAD
+**12 commits** by Alice, Bob, Carol
+
+## Features
+- feat: add dark mode toggle (`a1b2c3d` — Alice)
+
+## Bug Fixes
+- fix: resolve login redirect loop (`b7c8d9e` — Carol)
+```
 
 ---
 

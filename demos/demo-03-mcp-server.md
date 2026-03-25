@@ -1,16 +1,27 @@
 # Demo 03 — Build Your Own MCP Server
 
 **Duration:** ~12 min during Module 3
-**Prerequisites:** Node.js 18+, VS Code with Copilot
+**Prerequisites:** Node.js 18+, VS Code with Copilot, Git
 
-This demo builds a minimal MCP server from scratch in TypeScript/Node.js, then tests it from Copilot Chat.
+We'll build a **Git Changelog Generator** MCP server — a real tool every dev team needs. It reads your git history and generates structured release notes, categorizing commits into features, fixes, and breaking changes.
+
+---
+
+## The Problem We're Solving
+
+Every release cycle, someone manually writes changelog entries:
+- Scroll through `git log`, copy commit messages
+- Categorize them (feat, fix, chore, breaking)
+- Format into markdown for the release
+
+Let's automate this. Copilot + our MCP server = *"generate the changelog for v1.2.0"*.
 
 ---
 
 ## Step 1: Scaffold the Project
 
 ```bash
-mkdir mcp-demo && cd mcp-demo
+mkdir changelog-mcp && cd changelog-mcp
 npm init -y
 npm install @modelcontextprotocol/sdk zod
 ```
@@ -21,7 +32,7 @@ Update `package.json` to add `"type": "module"`:
 # Edit package.json and add: "type": "module"
 ```
 
-**Talking point:** The MCP SDK is the official package from Anthropic. `zod` is used for input validation schemas.
+**Talking point:** The MCP SDK is the official package from Anthropic. `zod` is used for input validation schemas. That's all we need — git is already on the machine.
 
 ---
 
@@ -32,91 +43,149 @@ Create `index.js`:
 ```javascript
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { execSync } from "child_process";
 import { z } from "zod";
 
-// Create the MCP server
 const server = new McpServer({
-  name: "workshop-demo",
+  name: "git-changelog",
   version: "1.0.0",
 });
 ```
 
-**Talking point:** Every MCP server starts with a name and version. The host (VS Code) uses this to identify the server.
+**Talking point:** We import `execSync` from Node's built-in `child_process` — that's how we'll call `git log`. No extra dependencies needed.
 
 ---
 
-## Step 3: Define Your First Tool
+## Step 3: Define the Changelog Tool
 
 Add below the server initialization:
 
 ```javascript
-// Tool 1: Analyze text for readability metrics
+// Tool 1: Generate a changelog between two git refs
 server.tool(
-  "analyze-text",
-  "Analyze text for word count, sentence count, and reading level",
+  "generate-changelog",
+  "Generate a structured changelog from git history between two refs (tags, branches, or commits)",
   {
-    text: z.string().describe("The text to analyze"),
+    from: z.string().describe("Start ref — tag, branch, or commit hash (e.g., 'v1.0.0', 'main~10')"),
+    to: z.string().default("HEAD").describe("End ref (default: HEAD)"),
+    repo_path: z.string().optional().describe("Path to the git repository (default: current directory)"),
   },
-  async ({ text }) => {
-    const words = text.trim().split(/\s+/).length;
-    const sentences = text.split(/[.!?]+/).filter(Boolean).length;
-    const avgWordsPerSentence = sentences > 0
-      ? (words / sentences).toFixed(1)
-      : "N/A";
+  async ({ from, to, repo_path }) => {
+    const cwd = repo_path || process.cwd();
 
-    // Simple readability estimate
-    let level = "Easy";
-    if (words / Math.max(sentences, 1) > 20) level = "Advanced";
-    else if (words / Math.max(sentences, 1) > 14) level = "Intermediate";
+    // Get commits between refs with conventional commit parsing
+    const raw = execSync(
+      `git log ${from}..${to} --pretty=format:"%h|%s|%an|%ad" --date=short`,
+      { cwd, encoding: "utf-8" }
+    );
 
-    return {
-      content: [{
-        type: "text",
-        text: [
-          `Words: ${words}`,
-          `Sentences: ${sentences}`,
-          `Avg words/sentence: ${avgWordsPerSentence}`,
-          `Reading level: ${level}`,
-        ].join("\n"),
-      }],
-    };
+    if (!raw.trim()) {
+      return { content: [{ type: "text", text: `No commits found between ${from} and ${to}` }] };
+    }
+
+    const commits = raw.trim().split("\n").map(line => {
+      const [hash, subject, author, date] = line.split("|");
+      return { hash, subject, author, date };
+    });
+
+    // Categorize by conventional commit prefix
+    const features = [];
+    const fixes = [];
+    const breaking = [];
+    const other = [];
+
+    for (const c of commits) {
+      if (c.subject.startsWith("feat")) features.push(c);
+      else if (c.subject.startsWith("fix")) fixes.push(c);
+      else if (c.subject.includes("BREAKING") || c.subject.startsWith("!")) breaking.push(c);
+      else other.push(c);
+    }
+
+    // Build markdown changelog
+    const lines = [`# Changelog: ${from} → ${to}`, ``, `**${commits.length} commits** by ${[...new Set(commits.map(c => c.author))].join(", ")}`, ``];
+
+    if (breaking.length) {
+      lines.push(`## BREAKING CHANGES`, ...breaking.map(c => `- ${c.subject} (\`${c.hash}\` — ${c.author}, ${c.date})`), ``);
+    }
+    if (features.length) {
+      lines.push(`## Features`, ...features.map(c => `- ${c.subject} (\`${c.hash}\` — ${c.author}, ${c.date})`), ``);
+    }
+    if (fixes.length) {
+      lines.push(`## Bug Fixes`, ...fixes.map(c => `- ${c.subject} (\`${c.hash}\` — ${c.author}, ${c.date})`), ``);
+    }
+    if (other.length) {
+      lines.push(`## Other Changes`, ...other.map(c => `- ${c.subject} (\`${c.hash}\` — ${c.author}, ${c.date})`), ``);
+    }
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 );
 ```
 
 **Talking point:** `server.tool()` takes 4 arguments:
-1. Tool name (what the model calls)
-2. Description (helps the model decide when to use it)
-3. Input schema (validated automatically via zod)
-4. Handler function (your actual logic)
+1. Tool name — `"generate-changelog"` (what the model calls)
+2. Description — helps the model decide *when* to use it
+3. Input schema — validated automatically via zod, with defaults and optionals
+4. Handler function — the actual logic (here: git + text processing)
 
 ---
 
-## Step 4: Add a Second Tool (Optional)
+## Step 4: Add a Commit Stats Tool
+
+A second tool that gives a quick summary — useful for standup reports:
 
 ```javascript
-// Tool 2: Generate a UUID
+// Tool 2: Get commit stats for a time period
 server.tool(
-  "generate-id",
-  "Generate a unique identifier with an optional prefix",
+  "commit-stats",
+  "Get commit statistics for a git repository over a time period — useful for standup reports and sprint reviews",
   {
-    prefix: z.string().optional().describe("Optional prefix for the ID"),
+    since: z.string().default("1 week ago").describe("Time period (e.g., '1 week ago', '2025-01-01', 'last Monday')"),
+    repo_path: z.string().optional().describe("Path to the git repository (default: current directory)"),
   },
-  async ({ prefix }) => {
-    const id = crypto.randomUUID();
-    const result = prefix ? `${prefix}-${id}` : id;
+  async ({ since, repo_path }) => {
+    const cwd = repo_path || process.cwd();
 
-    return {
-      content: [{
-        type: "text",
-        text: result,
-      }],
-    };
+    const log = execSync(
+      `git log --since="${since}" --pretty=format:"%an" --no-merges`,
+      { cwd, encoding: "utf-8" }
+    );
+
+    if (!log.trim()) {
+      return { content: [{ type: "text", text: `No commits found since ${since}` }] };
+    }
+
+    const authors = log.trim().split("\n");
+    const total = authors.length;
+
+    // Count per author
+    const counts = {};
+    for (const a of authors) counts[a] = (counts[a] || 0) + 1;
+
+    // Get file change stats
+    const shortstat = execSync(
+      `git diff --shortstat "HEAD@{${since}}" HEAD`,
+      { cwd, encoding: "utf-8" }
+    ).trim();
+
+    const lines = [
+      `## Commit Stats (since ${since})`,
+      ``,
+      `**Total commits:** ${total}`,
+      `**${shortstat || "No file changes"}**`,
+      ``,
+      `### By Author`,
+      ...Object.entries(counts)
+        .sort((a, b) => b[1] - a[1])
+        .map(([name, count]) => `- ${name}: ${count} commits`),
+    ];
+
+    return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 );
 ```
 
-**Talking point:** Tools can have optional parameters. The model decides whether to include them based on the user's request.
+**Talking point:** Notice how naturally tools compose — one for release changelogs, one for daily stats. The model picks the right one based on the user's question.
 
 ---
 
@@ -125,71 +194,112 @@ server.tool(
 Add at the bottom of `index.js`:
 
 ```javascript
-// Start the server
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Workshop MCP server running on stdio");
+  console.error("Git Changelog MCP server running on stdio");
 }
 
 main().catch(console.error);
 ```
 
-**Talking point:** `console.error` goes to stderr (for logging). `console.log` would go to stdout and interfere with the JSON-RPC protocol.
+**Talking point:** `console.error` goes to stderr (for logging). `console.log` would go to stdout and interfere with the JSON-RPC protocol. This is a common gotcha.
 
 ---
 
 ## Complete File
 
-The entire server is ~55 lines:
+The entire server is ~90 lines:
 
 ```javascript
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { execSync } from "child_process";
 import { z } from "zod";
 
 const server = new McpServer({
-  name: "workshop-demo",
+  name: "git-changelog",
   version: "1.0.0",
 });
 
 server.tool(
-  "analyze-text",
-  "Analyze text for word count, sentence count, and reading level",
-  { text: z.string().describe("The text to analyze") },
-  async ({ text }) => {
-    const words = text.trim().split(/\s+/).length;
-    const sentences = text.split(/[.!?]+/).filter(Boolean).length;
-    const avgWordsPerSentence = sentences > 0
-      ? (words / sentences).toFixed(1) : "N/A";
-    let level = "Easy";
-    if (words / Math.max(sentences, 1) > 20) level = "Advanced";
-    else if (words / Math.max(sentences, 1) > 14) level = "Intermediate";
-    return {
-      content: [{ type: "text", text:
-        `Words: ${words}\nSentences: ${sentences}\n` +
-        `Avg words/sentence: ${avgWordsPerSentence}\nReading level: ${level}`
-      }],
-    };
+  "generate-changelog",
+  "Generate a structured changelog from git history between two refs (tags, branches, or commits)",
+  {
+    from: z.string().describe("Start ref — tag, branch, or commit hash"),
+    to: z.string().default("HEAD").describe("End ref (default: HEAD)"),
+    repo_path: z.string().optional().describe("Path to the git repo"),
+  },
+  async ({ from, to, repo_path }) => {
+    const cwd = repo_path || process.cwd();
+    const raw = execSync(
+      `git log ${from}..${to} --pretty=format:"%h|%s|%an|%ad" --date=short`,
+      { cwd, encoding: "utf-8" }
+    );
+    if (!raw.trim()) {
+      return { content: [{ type: "text", text: `No commits between ${from}..${to}` }] };
+    }
+    const commits = raw.trim().split("\n").map(line => {
+      const [hash, subject, author, date] = line.split("|");
+      return { hash, subject, author, date };
+    });
+    const features = [], fixes = [], breaking = [], other = [];
+    for (const c of commits) {
+      if (c.subject.startsWith("feat")) features.push(c);
+      else if (c.subject.startsWith("fix")) fixes.push(c);
+      else if (c.subject.includes("BREAKING")) breaking.push(c);
+      else other.push(c);
+    }
+    const lines = [`# Changelog: ${from} → ${to}`, "",
+      `**${commits.length} commits** by ${[...new Set(commits.map(c => c.author))].join(", ")}`, ""];
+    if (breaking.length) lines.push("## BREAKING CHANGES",
+      ...breaking.map(c => `- ${c.subject} (\`${c.hash}\` — ${c.author}, ${c.date})`), "");
+    if (features.length) lines.push("## Features",
+      ...features.map(c => `- ${c.subject} (\`${c.hash}\` — ${c.author}, ${c.date})`), "");
+    if (fixes.length) lines.push("## Bug Fixes",
+      ...fixes.map(c => `- ${c.subject} (\`${c.hash}\` — ${c.author}, ${c.date})`), "");
+    if (other.length) lines.push("## Other Changes",
+      ...other.map(c => `- ${c.subject} (\`${c.hash}\` — ${c.author}, ${c.date})`), "");
+    return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 );
 
 server.tool(
-  "generate-id",
-  "Generate a unique identifier with an optional prefix",
-  { prefix: z.string().optional().describe("Optional prefix for the ID") },
-  async ({ prefix }) => {
-    const id = crypto.randomUUID();
-    return {
-      content: [{ type: "text", text: prefix ? `${prefix}-${id}` : id }],
-    };
+  "commit-stats",
+  "Get commit statistics for a git repo over a time period",
+  {
+    since: z.string().default("1 week ago").describe("Time period"),
+    repo_path: z.string().optional().describe("Path to the git repo"),
+  },
+  async ({ since, repo_path }) => {
+    const cwd = repo_path || process.cwd();
+    const log = execSync(
+      `git log --since="${since}" --pretty=format:"%an" --no-merges`,
+      { cwd, encoding: "utf-8" }
+    );
+    if (!log.trim()) {
+      return { content: [{ type: "text", text: `No commits since ${since}` }] };
+    }
+    const authors = log.trim().split("\n");
+    const counts = {};
+    for (const a of authors) counts[a] = (counts[a] || 0) + 1;
+    const shortstat = execSync(
+      `git diff --shortstat "HEAD@{${since}}" HEAD`,
+      { cwd, encoding: "utf-8" }
+    ).trim();
+    const lines = [`## Commit Stats (since ${since})`, "",
+      `**Total commits:** ${authors.length}`, `**${shortstat || "No file changes"}**`, "",
+      "### By Author",
+      ...Object.entries(counts).sort((a, b) => b[1] - a[1])
+        .map(([name, count]) => `- ${name}: ${count} commits`)];
+    return { content: [{ type: "text", text: lines.join("\n") }] };
   }
 );
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("Workshop MCP server running on stdio");
+  console.error("Git Changelog MCP server running on stdio");
 }
 
 main().catch(console.error);
@@ -204,10 +314,10 @@ Create `.vscode/mcp.json` in your workspace:
 ```json
 {
   "servers": {
-    "workshop-demo": {
+    "git-changelog": {
       "type": "stdio",
       "command": "node",
-      "args": ["./mcp-demo/index.js"]
+      "args": ["./changelog-mcp/index.js"]
     }
   }
 }
@@ -219,40 +329,67 @@ Create `.vscode/mcp.json` in your workspace:
 
 ## Step 7: Test from Copilot Chat
 
-Open Copilot Chat and try these prompts:
+Open Copilot Chat in any git repo and try these prompts:
 
-### Test 1 — Analyze text:
+### Test 1 — Generate a changelog between tags:
 ```
-Use the analyze-text tool to analyze this paragraph:
-"The quick brown fox jumps over the lazy dog. This sentence is a pangram.
-It contains every letter of the English alphabet at least once."
+Generate a changelog from the last tag to HEAD
 ```
 
 **Expected output:**
-```
-Words: 27
-Sentences: 3
-Avg words/sentence: 9.0
-Reading level: Easy
+```markdown
+# Changelog: v1.2.0 → HEAD
+
+**12 commits** by Alice, Bob, Carol
+
+## Features
+- feat: add dark mode toggle (`a1b2c3d` — Alice, 2025-03-20)
+- feat: implement user profile page (`d4e5f6a` — Bob, 2025-03-18)
+
+## Bug Fixes
+- fix: resolve login redirect loop (`b7c8d9e` — Carol, 2025-03-22)
+- fix: handle null avatar URL (`f0a1b2c` — Alice, 2025-03-19)
+
+## Other Changes
+- chore: update dependencies (`1234567` — Bob, 2025-03-21)
+- docs: update API reference (`89abcde` — Carol, 2025-03-17)
 ```
 
-### Test 2 — Generate ID:
+### Test 2 — Sprint review stats:
 ```
-Generate a unique ID with the prefix "user"
+What are the commit stats for our repo in the last 2 weeks?
 ```
 
 **Expected output:**
-```
-user-a1b2c3d4-e5f6-7890-abcd-ef1234567890
+```markdown
+## Commit Stats (since 2 weeks ago)
+
+**Total commits:** 24
+**15 files changed, 482 insertions(+), 127 deletions(-)**
+
+### By Author
+- Alice: 10 commits
+- Bob: 8 commits
+- Carol: 6 commits
 ```
 
-### Test 3 — Combined (shows tool selection):
+### Test 3 — Natural language (shows tool selection):
 ```
-Analyze the readability of my README file and generate an ID I can
-use to track this analysis
+I need to prepare release notes for the sprint review. We tagged v2.1.0
+last Friday. What changed since then, and who contributed the most?
 ```
 
-**Expected:** Copilot calls both tools and combines the results.
+**Expected:** Copilot calls *both* tools — `generate-changelog` for the notes and `commit-stats` for author contributions — then combines them into a cohesive answer.
+
+---
+
+## Why This Example Works for the Workshop
+
+1. **Everyone has git** — no API keys, cloud accounts, or external services needed
+2. **Instantly testable** — every audience member has repos with real history
+3. **Solves a real pain point** — manual changelogs are tedious and error-prone
+4. **Shows tool composition** — two tools that Copilot combines intelligently
+5. **Bridges to Module 4** — same MCP patterns, just different domain (git vs IaC)
 
 ---
 
@@ -262,8 +399,9 @@ use to track this analysis
 |-------|-----|
 | Server not appearing in tools list | Restart VS Code / Copilot Chat |
 | "Cannot find module" error | Check `"type": "module"` in package.json |
-| No output from tool | Check stderr in Output panel → MCP |
-| Tool errors silently | Add try/catch in handler, log to stderr |
+| "Not a git repository" | Ensure repo_path points to a valid git repo |
+| `git log` returns empty | Check that the ref names (tags/branches) exist |
+| No output from tool | Check stderr in VS Code Output panel → MCP |
 
 ---
 
@@ -271,6 +409,6 @@ use to track this analysis
 
 1. An MCP server is just a program that speaks JSON-RPC over stdio or HTTP
 2. The SDK handles all protocol details — you just define tools
-3. Zod schemas give you free input validation and help the model understand parameters
-4. Total code: ~55 lines for a working, multi-tool MCP server
-5. The same patterns scale to production (ghcp-iac-workflow = same concepts in Go)
+3. Zod schemas give you free input validation *and* help the model understand parameters
+4. Real utility in ~90 lines — this could ship as a team tool today
+5. The same patterns scale to production (ghcp-iac-workflow = same concepts in Go, 10 agents)
